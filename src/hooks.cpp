@@ -5,32 +5,33 @@
 #include <fstream>
 #include <iostream>
 #include <filesystem>
+#include "steam/client_module_manager.hpp"
+#include "logger.hpp"
+#include "utils.hpp"
 #include "hooks.hpp"
 
-static std::filesystem::path get_known_folder_path(const KNOWNFOLDERID& folder, KNOWN_FOLDER_FLAG flag = KF_FLAG_DEFAULT);
-
-static FILE* g_output{ nullptr };
+vacmon::hooks& vacmon::hooks::get() {
+    static vacmon::hooks instance;
+    return instance;
+}
 
 bool vacmon::hooks::install() {
 
-    AllocConsole();
-    SetConsoleOutputCP(CP_UTF8);
-    freopen_s(&g_output, "CONOUT$", "w", stdout);
+    m_logger = std::make_unique<logger>("vacmon");
 
     const auto console_output{ GetStdHandle(STD_OUTPUT_HANDLE) };
     if (DWORD console_mode{ 0 }; GetConsoleMode(console_output, &console_mode)) {
         SetConsoleMode(console_output, console_mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
     }
 
-    std::cout << "\x1b[93m";
-    std::cout << "initializing..." << std::endl;
+    m_logger->info("initializing...\n");
 
     const auto steamservice_dll{ reinterpret_cast<std::uint8_t*>(GetModuleHandleA("steamservice.dll")) };
     const auto p_load_image{ xscan::pattern{ "E8 ? ? ? ? 84 C0 75 16 8B 43 10" }
         .scan(xscan::pe_sections(steamservice_dll)).add(1).rip() };
 
     if (!p_load_image) {
-        std::cout << "failed to find load_image." << std::endl;
+        m_logger->error("failed to find load_image");
         return false;
     }
 
@@ -38,34 +39,35 @@ bool vacmon::hooks::install() {
         .scan(xscan::pe_sections(steamservice_dll)).add(1).rip() };
 
     if (!p_protect_image) {
-        std::cout << "failed to find protect_image." << std::endl;
+        m_logger->error("failed to find protect_image");
         return false;
     }
 
-    std::cout << "  load_image    : steamservice.dll+0x" << std::hex << (p_load_image - steamservice_dll) << std::endl;
-    std::cout << "  protect_image : steamservice.dll+0x" << std::hex << (p_protect_image - steamservice_dll) << std::endl;
+    m_logger->info("load_image: steamservice.dll+0x{:X}", (p_load_image - steamservice_dll));
+    m_logger->info("protect_image: steamservice.dll+0x{:X}", (p_protect_image - steamservice_dll));
 
     if (MH_Initialize() != MH_OK) {
-        std::cout << "failed to initialize minhook." << std::endl;
+        m_logger->error("failed to initialize minhook");
         return false;
     }
 
     if (MH_CreateHook(p_load_image, &load_image, reinterpret_cast<LPVOID*>(&m_load_image)) != MH_OK) {
-        std::cout << "failed to create load_image hook." << std::endl;
+        m_logger->error("failed to create load_image hook");
         return false;
     }
 
     if (MH_CreateHook(p_protect_image, &protect_image, reinterpret_cast<LPVOID*>(&m_protect_image)) != MH_OK) {
-        std::cout << "failed to create protect_image hook." << std::endl;
+        m_logger->error("failed to create protect_image hook");
         return false;
     }
 
     if (MH_EnableHook(MH_ALL_HOOKS) != MH_OK) {
-        std::cout << "failed to enable hooks." << std::endl;
+        m_logger->error("failed to enable hooks");
         return false;
     }
 
-    std::cout << "\nready\n" << std::endl;
+    m_logger->success("ready\n");
+
     return true;
 }
 
@@ -73,33 +75,31 @@ bool vacmon::hooks::uninstall() {
 
     MH_DisableHook(MH_ALL_HOOKS);
     MH_Uninitialize();
-    free(g_output);
     FreeConsole();
     return true;
 }
 
-bool __stdcall vacmon::hooks::load_image(module_info* info, std::uint8_t flags) {
+bool __stdcall vacmon::hooks::load_image(steam::module_info* info, std::uint8_t flags) {
 
     const auto manually_mapped{ (flags & 2) != 0 };
 
-    const auto result{ m_load_image(info, flags) };
+    const auto result{ hooks::get().m_load_image(info, flags) };
 
     if (info && info->mapped_module && manually_mapped) {
 
-        std::cout << "ran module (0x"
-            << std::hex << info->crc32 << ") at 0x"
-            << std::hex << reinterpret_cast<std::uintptr_t>(info->mapped_module->image_base)
-            << std::endl;
+        hooks::get().m_logger->info("load_image\n \x1b[93m- \x1b[90mcrc32: 0x{:X}\n \x1b[93m- \x1b[90mimage base: 0x{:X}\n", info->crc32, reinterpret_cast<std::uintptr_t>(info->mapped_module->image_base));
 
-        const auto folder{ get_known_folder_path(FOLDERID_Desktop) / "vacmon" / "modules" };
+        const auto folder{ utils::get_known_folder_path(FOLDERID_Desktop) / "vacmon" / "modules" };
         if (!std::filesystem::exists(folder) && !std::filesystem::create_directories(folder)) {
 
-            std::cout << "failed to create folder: " << folder << std::endl;
+            hooks::get().m_logger->error("failed to create folder: \"{}\"", folder.string());
             return result;
         }
 
         const auto file_name{ std::format("vac.0x{:X}.dll", info->crc32) };
-        if (std::filesystem::exists(folder / file_name)) {
+        const auto full_path{ folder / file_name };
+
+        if (std::filesystem::exists(full_path)) {
             return result;
         }
 
@@ -122,23 +122,23 @@ bool __stdcall vacmon::hooks::load_image(module_info* info, std::uint8_t flags) 
             section.SizeOfRawData = section.Misc.VirtualSize;
         }
 
-        std::ofstream file(folder / file_name, std::ios::out | std::ios::binary);
+        std::ofstream file(full_path, std::ios::out | std::ios::binary);
         if (file) {
             file.write(
                 reinterpret_cast<const char*>(image_data.data()),
                 image_size
             );
-            std::cout << "dumped " << file_name << std::endl;
+            hooks::get().m_logger->success("dumped module: {}\n", file_name);
         }
         else {
-            std::cout << "failed to open file: " << folder / file_name << std::endl;
+            hooks::get().m_logger->error("failed to open file: \"{}\"", full_path.string());
         }
     }
 
     return result;
 }
 
-int __cdecl vacmon::hooks::protect_image(mapped_module_info* info) {
+int __cdecl vacmon::hooks::protect_image(steam::mapped_module_info* info) {
 
     for (std::int16_t i{ 0 }; i < info->nt_headers->FileHeader.NumberOfSections; i++) {
         auto& section{ IMAGE_FIRST_SECTION(info->nt_headers)[i] };
@@ -152,18 +152,4 @@ int __cdecl vacmon::hooks::protect_image(mapped_module_info* info) {
     }
 
     return info->nt_headers->FileHeader.NumberOfSections;
-}
-
-std::filesystem::path get_known_folder_path(const KNOWNFOLDERID& folder, KNOWN_FOLDER_FLAG flag) {
-
-    std::filesystem::path result;
-    {
-        wchar_t* path_buf{ nullptr };
-        if (SUCCEEDED(::SHGetKnownFolderPath(folder, 0, 0, &path_buf))) {
-            result = std::filesystem::path(path_buf);
-        }
-
-        ::CoTaskMemFree(path_buf);
-    }
-    return result;
 }
