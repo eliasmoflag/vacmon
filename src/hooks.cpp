@@ -1,5 +1,6 @@
 #include <Windows.h>
 #include <ShlObj.h>
+#include <intrin.h>
 #include <MinHook.h>
 #include <xscan.hpp>
 #include <fstream>
@@ -43,8 +44,8 @@ bool vacmon::hooks::install() {
         return false;
     }
 
-    m_logger->info("load_image: steamservice.dll+0x{:X}", (p_load_image - steamservice_dll));
-    m_logger->info("protect_image: steamservice.dll+0x{:X}", (p_protect_image - steamservice_dll));
+    m_logger->info("load_image: {}", utils::format_address(p_load_image));
+    m_logger->info("protect_image: {}", utils::format_address(p_protect_image));
 
     if (MH_Initialize() != MH_OK) {
         m_logger->error("failed to initialize minhook");
@@ -58,6 +59,11 @@ bool vacmon::hooks::install() {
 
     if (MH_CreateHook(p_protect_image, &protect_image, reinterpret_cast<LPVOID*>(&m_protect_image)) != MH_OK) {
         m_logger->error("failed to create protect_image hook");
+        return false;
+    }
+
+    if (MH_CreateHookApi(L"ntdll.dll", "NtQueryVirtualMemory", &nt_query_virtual_memory, reinterpret_cast<LPVOID*>(&m_nt_query_virtual_memory)) != MH_OK) {
+        m_logger->error("failed to create nt_query_virtual_memory hook");
         return false;
     }
 
@@ -79,20 +85,27 @@ bool vacmon::hooks::uninstall() {
     return true;
 }
 
-bool __stdcall vacmon::hooks::load_image(steam::module_info* info, std::uint8_t flags) {
-
+bool __stdcall vacmon::hooks::load_image(
+    steam::module_info* info,
+    std::uint8_t flags
+) {
     const auto manually_mapped{ (flags & 2) != 0 };
 
     const auto result{ hooks::get().m_load_image(info, flags) };
 
     if (info && info->mapped_module && manually_mapped) {
 
-        hooks::get().m_logger->info("load_image\n \x1b[93m- \x1b[90mcrc32: 0x{:X}\n \x1b[93m- \x1b[90mimage base: 0x{:X}\n", info->crc32, reinterpret_cast<std::uintptr_t>(info->mapped_module->image_base));
+        auto& log{ *hooks::get().m_logger };
+
+        log.info("load_image (return: {})", utils::format_address(_ReturnAddress()));
+        log.write(" \x1b[93m-\x1b[90m crc32: 0x{:x}\n", info->crc32);
+        log.write(" \x1b[93m-\x1b[90m image base: 0x{:x}\n", info->mapped_module->nt_headers->OptionalHeader.ImageBase);
 
         const auto folder{ utils::get_known_folder_path(FOLDERID_Desktop) / "vacmon" / "modules" };
         if (!std::filesystem::exists(folder) && !std::filesystem::create_directories(folder)) {
 
             hooks::get().m_logger->error("failed to create folder: \"{}\"", folder.string());
+            log.write("\n");
             return result;
         }
 
@@ -100,26 +113,27 @@ bool __stdcall vacmon::hooks::load_image(steam::module_info* info, std::uint8_t 
         const auto full_path{ folder / file_name };
 
         if (std::filesystem::exists(full_path)) {
+            log.write("\n");
             return result;
         }
 
-        const auto image_base{ info->mapped_module->image_base };
+        const auto image_base{ reinterpret_cast<void*>(info->mapped_module->nt_headers->OptionalHeader.ImageBase) };
         const auto image_size{ info->mapped_module->nt_headers->OptionalHeader.SizeOfImage };
 
         std::vector<std::uint8_t> image_data(image_size);
-        std::copy_n(reinterpret_cast<const std::uint8_t*>(image_base), image_data.size(), image_data.data());
+        std::copy_n(reinterpret_cast<const std::uint8_t*>(image_base), image_size, image_data.data());
+
+        log.write(" \x1b[93m-\x1b[90m section count: {}\n", info->mapped_module->nt_headers->FileHeader.NumberOfSections);
+        log.write("\n");
 
         const auto dos_header{ reinterpret_cast<IMAGE_DOS_HEADER*>(image_data.data()) };
         const auto nt_headers{ reinterpret_cast<IMAGE_NT_HEADERS*>(image_data.data() + dos_header->e_lfanew) };
 
-        nt_headers->OptionalHeader.ImageBase = reinterpret_cast<std::uintptr_t>(image_base);
-
         for (std::uint16_t i{ 0 }; i < nt_headers->FileHeader.NumberOfSections; i++) {
 
             auto& section{ IMAGE_FIRST_SECTION(nt_headers)[i] };
-
-            section.PointerToRawData = section.VirtualAddress;
-            section.SizeOfRawData = section.Misc.VirtualSize;
+            const auto alloc_section{ IMAGE_FIRST_SECTION(info->mapped_module->nt_headers) + i };
+            section.PointerToRawData = alloc_section->VirtualAddress;
         }
 
         std::ofstream file(full_path, std::ios::out | std::ios::binary);
@@ -138,8 +152,9 @@ bool __stdcall vacmon::hooks::load_image(steam::module_info* info, std::uint8_t 
     return result;
 }
 
-int __cdecl vacmon::hooks::protect_image(steam::mapped_module_info* info) {
-
+int __cdecl vacmon::hooks::protect_image(
+    steam::mapped_module_info* info
+) {
     for (std::int16_t i{ 0 }; i < info->nt_headers->FileHeader.NumberOfSections; i++) {
         auto& section{ IMAGE_FIRST_SECTION(info->nt_headers)[i] };
 
@@ -152,4 +167,36 @@ int __cdecl vacmon::hooks::protect_image(steam::mapped_module_info* info) {
     }
 
     return info->nt_headers->FileHeader.NumberOfSections;
+}
+
+NTSTATUS NTAPI vacmon::hooks::nt_query_virtual_memory(
+    HANDLE process_handle,
+    PVOID base_address,
+    MEMORY_INFORMATION_CLASS memory_information_class,
+    PVOID memory_information,
+    SIZE_T memory_information_length,
+    PSIZE_T return_length
+) {
+    const auto result{ hooks::get().m_nt_query_virtual_memory(
+        process_handle,
+        base_address,
+        memory_information_class,
+        memory_information,
+        memory_information_length,
+        return_length
+    ) };
+
+    if (process_handle != GetCurrentProcess() &&
+        memory_information_class == MEMORY_INFORMATION_CLASS::MemoryBasicInformation
+    ) {
+        auto& log{ *hooks::get().m_logger };
+
+        log.info("nt_query_virtual_memory (return: 0x{:p})", utils::format_address(_ReturnAddress()));
+        log.write(" \x1b[93m-\x1b[90m process_handle: 0x{:x}\n", reinterpret_cast<std::uintptr_t>(process_handle));
+        log.write(" \x1b[93m-\x1b[90m base_address: 0x{:x}\n", reinterpret_cast<std::uintptr_t>(base_address));
+        log.write(" \x1b[93m-\x1b[90m memory_information_class: 0x{:x}\n", static_cast<std::underlying_type_t<MEMORY_INFORMATION_CLASS>>(memory_information_class));
+        log.write("\n");
+    }
+
+    return result;
 }
